@@ -1,0 +1,7 @@
+# 個人設定（熱鍵、捷徑路徑），不上傳
+FolderFilter.ini
+
+# Windows / 編輯器雜項
+Thumbs.db
+desktop.ini
+*.bak
