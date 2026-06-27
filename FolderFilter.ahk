@@ -2,37 +2,48 @@
 #SingleInstance Force
 
 ; =====================================================================
-;  資料夾即時篩選器 (FolderFilter)
+;  資料夾即時篩選器 (FolderFilter)  v1.1
 ;  熱鍵（可在設定中變更，預設 Ctrl+Alt+F）：對目前檔案總管資料夾叫出篩選視窗
 ;
-;  關鍵字：空白分隔多組 AND；含 * 或 ? 時為萬用字元（例 *.md）；行內 -字 為排除
-;  選項：含子資料夾 / 排除關鍵字 / 排除資料夾 / 排除檔案 /
-;        排除小於 N KB / 排除大於 N KB / 排除 N 天前 / 排除 N 天以後 的檔案
-;  按鈕：截圖 / 設定（熱鍵·開機載入·10 捷徑）/ 強制刷新
-;  捷徑：10 個，依視窗寬度自動換行；點一下切換篩選目錄
-;  欄位：名稱 | 副檔名 | 大小 | 類型 | 修改日期 | 建立日期（點標題排序）
-;  欄寬：標題列右鍵 或 項目右鍵 可「自動調整欄位至最適大小」
-;  操作：↑/↓ 選取 · Enter/雙擊 開啟 · F2 改名 · 右鍵 選單 · Del 刪除 · Esc 關閉
-;  底部狀態列：單選顯示完整路徑；多選顯示數量
+;  v1.1 變更（依 3CLI 審查）：
+;   - 即時過濾加 180ms debounce（大資料夾不再每鍵卡死）
+;   - 單遍掃描（FDR），遞迴 I/O 減半
+;   - 右鍵先選取游標所在列；空白處只開放貼上/調整欄寬（避免誤刪錯檔）
+;   - 改名做檔名合法性驗證；貼上防止把資料夾貼到自身/子目錄
+;   - CF_HDROP 失敗路徑釋放記憶體；剪下貼上成功後清空剪貼簿
+;   - 萬用字元 token 預編譯；掃描/排序/顯示上限會在狀態列提示
+;   - 重開保留篩選字、勾選、視窗位置大小
+;   - 批次失敗彙總一次顯示；刪除/剪貼簿操作需明確選取
+;   - 新增「選資料夾」按鈕（Win11 多分頁抓不到時的退路）
+;  v1.1 新功能：
+;   - 右鍵選單「複製路徑」下方新增「開啟路徑」（在檔案總管定位該項目）
+;   - 捷徑數量可在設定中增減（最少 10 組）
 ; =====================================================================
 
 global gGui := 0, gEdit := 0, gLV := 0, gPathTxt := 0, gStatus := 0, gSB := 0
-global gItems := [], gCurrentFolder := ""
+global gItems := [], gCurrentFolder := "", gScanTruncated := false
 global gChkSub := 0, gChkExc := 0, gChkExclDir := 0, gChkExclFile := 0
 global gChkSmall := 0, gChkBig := 0, gChkOld := 0, gChkNew := 0
 global gEditKB := 0, gEditKBBig := 0, gEditDays := 0, gEditDaysNew := 0
 global gScBtns := [], gShortTop := 0, gSBH := 24, gHeaderHwnd := 0
 global gSortCol := 0, gSortDir := 1
 global gHotkey := "^!f", gHotkeyActive := "", gShortcuts := []
-global COL_TYPE := 4, COL_PATH := 7     ; 名稱1 副檔名2 大小3 類型4 修改5 建立6 路徑7(隱藏)
+global COL_PATH := 7     ; 名稱1 副檔名2 大小3 類型4 修改5 建立6 路徑7(隱藏)
+global CF_HDROP := 15, GHND := 0x0042
 global INI := A_ScriptDir "\FolderFilter.ini"
-global RUNKEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
-global RUNVAL := "FolderFilter"
+global RUNKEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run", RUNVAL := "FolderFilter"
 global SCAN_CAP := 200000, SORT_CAP := 20000, DISP_CAP := 5000
+; 重開保留的 UI 狀態
+global gSt := Map("filter", "", "sub", 0, "exc", 0, "exclDir", 0, "exclFile", 0,
+    "small", 0, "big", 0, "old", 0, "new", 0,
+    "kb", "100", "kbBig", "10240", "days", "30", "daysNew", "7",
+    "x", "", "y", "", "w", 820, "h", 680)
+; 設定視窗暫存
+global gSetGui := 0, gSetState := 0, gSetHk := 0, gSetAuto := 0, gSetNames := [], gSetPaths := []
 
 LoadConfig()
 RegisterHotkey()
-OnMessage(0x7B, OnHeaderContext)   ; WM_CONTEXTMENU → 標題列右鍵調整欄寬
+OnMessage(0x7B, OnHeaderContext)   ; 標題列右鍵調整欄寬
 A_TrayMenu.Add("設定", (*) => ShowSettings())
 A_TrayMenu.Add("離開", (*) => ExitApp())
 
@@ -40,8 +51,10 @@ A_TrayMenu.Add("離開", (*) => ExitApp())
 LoadConfig() {
     global gHotkey, gShortcuts, INI
     gHotkey := IniRead(INI, "General", "Hotkey", "^!f")
+    cnt := IniRead(INI, "Shortcuts", "Count", "10")
+    cnt := (IsInteger(cnt) && cnt + 0 >= 10) ? cnt + 0 : 10
     gShortcuts := []
-    loop 10 {
+    loop cnt {
         n := IniRead(INI, "Shortcuts", A_Index "Name", "")
         p := IniRead(INI, "Shortcuts", A_Index "Path", "")
         gShortcuts.Push({ name: n, path: p })
@@ -51,9 +64,16 @@ LoadConfig() {
 SaveConfig() {
     global gHotkey, gShortcuts, INI
     IniWrite(gHotkey, INI, "General", "Hotkey")
-    loop 10 {
+    IniWrite(gShortcuts.Length, INI, "Shortcuts", "Count")
+    loop gShortcuts.Length {
         IniWrite(gShortcuts[A_Index].name, INI, "Shortcuts", A_Index "Name")
         IniWrite(gShortcuts[A_Index].path, INI, "Shortcuts", A_Index "Path")
+    }
+    i := gShortcuts.Length + 1
+    loop 50 {
+        try IniDelete(INI, "Shortcuts", i "Name")
+        try IniDelete(INI, "Shortcuts", i "Path")
+        i++
     }
 }
 
@@ -79,9 +99,10 @@ IsAutoStart() {
 
 SetAutoStart(enable) {
     global RUNKEY, RUNVAL
-    if enable
-        RegWrite('"' A_AhkPath '" "' A_ScriptFullPath '"', "REG_SZ", RUNKEY, RUNVAL)
-    else
+    if enable {
+        cmd := A_IsCompiled ? ('"' A_ScriptFullPath '"') : ('"' A_AhkPath '" "' A_ScriptFullPath '"')
+        RegWrite(cmd, "REG_SZ", RUNKEY, RUNVAL)
+    } else
         try RegDelete(RUNKEY, RUNVAL)
 }
 
@@ -96,12 +117,19 @@ ShowFilter() {
     if (folder != "")
         gCurrentFolder := folder
     BuildGui()
-    gEdit.Value := ""
     ScanItems()
     UpdatePathText()
     DoFilter()
-    gGui.Show("w820 h680")
+    ShowGui()
     gEdit.Focus()
+}
+
+ShowGui() {
+    global gGui, gSt
+    if (gSt["x"] = "")
+        gGui.Show("w" gSt["w"] " h" gSt["h"])
+    else
+        gGui.Show("x" gSt["x"] " y" gSt["y"] " w" gSt["w"] " h" gSt["h"])
 }
 
 GetActiveExplorerPath() {
@@ -120,11 +148,12 @@ GetActiveExplorerPath() {
 }
 
 BuildGui() {
-    global gGui, gEdit, gLV, gPathTxt, gStatus, gSB
+    global gGui, gEdit, gLV, gPathTxt, gStatus, gSB, gSt
     global gChkSub, gChkExc, gChkExclDir, gChkExclFile
     global gChkSmall, gChkBig, gChkOld, gChkNew, gEditKB, gEditKBBig, gEditDays, gEditDaysNew
     global gScBtns, gShortTop, gSBH, gHeaderHwnd
     if gGui {
+        try SetTimer(DoFilter, 0)
         try gGui.Destroy()
         gGui := 0
     }
@@ -134,45 +163,48 @@ BuildGui() {
 
     gPathTxt := gGui.AddText("xm w800", "")
     gEdit := gGui.AddEdit("xm w800")
-    gEdit.OnEvent("Change", (*) => DoFilter())
+    gEdit.Value := gSt["filter"]
+    gEdit.OnEvent("Change", (*) => ScheduleFilter())
 
-    gChkSub := gGui.AddCheckbox("xm", "含子資料夾")
-    gChkExc := gGui.AddCheckbox("x+24 yp", "排除關鍵字")
-    gChkExclDir := gGui.AddCheckbox("x+24 yp", "排除資料夾")
-    gChkExclFile := gGui.AddCheckbox("x+24 yp", "排除檔案")
+    gChkSub := gGui.AddCheckbox("xm", "含子資料夾"), gChkSub.Value := gSt["sub"]
+    gChkExc := gGui.AddCheckbox("x+24 yp", "排除關鍵字"), gChkExc.Value := gSt["exc"]
+    gChkExclDir := gGui.AddCheckbox("x+24 yp", "排除資料夾"), gChkExclDir.Value := gSt["exclDir"]
+    gChkExclFile := gGui.AddCheckbox("x+24 yp", "排除檔案"), gChkExclFile.Value := gSt["exclFile"]
     gChkSub.OnEvent("Click", (*) => OnModeChange())
     gChkExc.OnEvent("Click", (*) => DoFilter())
     gChkExclDir.OnEvent("Click", (*) => DoFilter())
     gChkExclFile.OnEvent("Click", (*) => DoFilter())
 
-    gChkSmall := gGui.AddCheckbox("xm", "排除小於")
-    gEditKB := gGui.AddEdit("x+6 yp w64", "100")
+    gChkSmall := gGui.AddCheckbox("xm", "排除小於"), gChkSmall.Value := gSt["small"]
+    gEditKB := gGui.AddEdit("x+6 yp w64", gSt["kb"])
     gGui.AddText("x+4 yp", "KB 的檔案")
-    gChkBig := gGui.AddCheckbox("x+24 yp", "排除大於")
-    gEditKBBig := gGui.AddEdit("x+6 yp w64", "10240")
+    gChkBig := gGui.AddCheckbox("x+24 yp", "排除大於"), gChkBig.Value := gSt["big"]
+    gEditKBBig := gGui.AddEdit("x+6 yp w64", gSt["kbBig"])
     gGui.AddText("x+4 yp", "KB 的檔案")
 
-    gChkOld := gGui.AddCheckbox("xm", "排除")
-    gEditDays := gGui.AddEdit("x+6 yp w64", "30")
+    gChkOld := gGui.AddCheckbox("xm", "排除"), gChkOld.Value := gSt["old"]
+    gEditDays := gGui.AddEdit("x+6 yp w64", gSt["days"])
     gGui.AddText("x+4 yp", "天前的檔案")
-    gChkNew := gGui.AddCheckbox("x+24 yp", "排除")
-    gEditDaysNew := gGui.AddEdit("x+6 yp w64", "7")
+    gChkNew := gGui.AddCheckbox("x+24 yp", "排除"), gChkNew.Value := gSt["new"]
+    gEditDaysNew := gGui.AddEdit("x+6 yp w64", gSt["daysNew"])
     gGui.AddText("x+4 yp", "天以後的檔案")
 
     for c in [gChkSmall, gChkBig, gChkOld, gChkNew]
         c.OnEvent("Click", (*) => DoFilter())
     for c in [gEditKB, gEditKBBig, gEditDays, gEditDaysNew]
-        c.OnEvent("Change", (*) => DoFilter())
+        c.OnEvent("Change", (*) => ScheduleFilter())
 
     btnShot := gGui.AddButton("xm w70", "截圖")
     btnSet := gGui.AddButton("x+6 yp w70", "設定")
     btnRef := gGui.AddButton("x+6 yp w90", "強制刷新")
+    btnPick := gGui.AddButton("x+6 yp w90", "選資料夾")
     btnShot.OnEvent("Click", (*) => Screenshot())
     btnSet.OnEvent("Click", (*) => ShowSettings())
     btnRef.OnEvent("Click", (*) => Refresh())
+    btnPick.OnEvent("Click", (*) => PickFolder())
 
     gScBtns := []
-    loop 10 {
+    loop gShortcuts.Length {
         i := A_Index
         b := gGui.AddButton((i = 1 ? "xm" : "x+5 yp") " w100 h26", ShortcutLabel(i))
         b.OnEvent("Click", ShortcutClick.Bind(i))
@@ -191,23 +223,49 @@ BuildGui() {
     gLV.ModifyCol(4, 60)
     gLV.ModifyCol(5, 120)
     gLV.ModifyCol(6, 120)
-    gLV.ModifyCol(7, 0)        ; 隱藏完整路徑欄
+    gLV.ModifyCol(7, 0)
     gLV.OnEvent("DoubleClick", (*) => OpenSelected())
     gLV.OnEvent("ContextMenu", ShowCtxMenu)
     gLV.OnEvent("ColClick", OnColClick)
     gLV.OnEvent("ItemSelect", (*) => UpdateSelStatus())
     gLV.OnEvent("ItemFocus", (*) => UpdateSelStatus())
-    gHeaderHwnd := SendMessage(0x101F, 0, 0, gLV.Hwnd)   ; LVM_GETHEADER
+    gHeaderHwnd := SendMessage(0x101F, 0, 0, gLV.Hwnd)
 
     gSB := gGui.AddStatusBar()
 
-    gGui.OnEvent("Escape", (*) => gGui.Hide())
-    gGui.OnEvent("Close", (*) => gGui.Hide())
+    gGui.OnEvent("Escape", (*) => SaveOnHide())
+    gGui.OnEvent("Close", (*) => SaveOnHide())
     gGui.OnEvent("Size", GuiResize)
 
     gSB.GetPos(, , , &sbh)
     if sbh
         gSBH := sbh
+}
+
+SaveOnHide() {
+    global gGui
+    SaveUIState()
+    try SetTimer(DoFilter, 0)
+    gGui.Hide()
+}
+
+SaveUIState() {
+    global gGui, gSt, gEdit, gChkSub, gChkExc, gChkExclDir, gChkExclFile
+    global gChkSmall, gChkBig, gChkOld, gChkNew, gEditKB, gEditKBBig, gEditDays, gEditDaysNew
+    if !gGui
+        return
+    try {
+        gGui.GetClientPos(, , &cw, &ch)
+        WinGetPos(&wx, &wy, , , "ahk_id " gGui.Hwnd)
+        gSt["x"] := wx, gSt["y"] := wy, gSt["w"] := cw, gSt["h"] := ch
+    }
+    gSt["filter"] := gEdit.Value
+    gSt["sub"] := gChkSub.Value, gSt["exc"] := gChkExc.Value
+    gSt["exclDir"] := gChkExclDir.Value, gSt["exclFile"] := gChkExclFile.Value
+    gSt["small"] := gChkSmall.Value, gSt["big"] := gChkBig.Value
+    gSt["old"] := gChkOld.Value, gSt["new"] := gChkNew.Value
+    gSt["kb"] := gEditKB.Value, gSt["kbBig"] := gEditKBBig.Value
+    gSt["days"] := gEditDays.Value, gSt["daysNew"] := gEditDaysNew.Value
 }
 
 GuiResize(g, MinMax, W, H) {
@@ -247,7 +305,7 @@ LayoutAll(W, H) {
 UpdatePathText() {
     global gPathTxt, gCurrentFolder, gItems
     if (gCurrentFolder = "")
-        gPathTxt.Value := "（尚未選擇資料夾：請開啟檔案總管後按熱鍵，或點下方捷徑）"
+        gPathTxt.Value := "（尚未選擇資料夾：請開啟檔案總管後按熱鍵，或按「選資料夾」/捷徑）"
     else
         gPathTxt.Value := gCurrentFolder "　(" gItems.Length " 個項目)"
 }
@@ -258,22 +316,33 @@ OnModeChange() {
     gEdit.Focus()
 }
 
+PickFolder() {
+    global gGui, gCurrentFolder, gEdit
+    gGui.Opt("-AlwaysOnTop")
+    sel := DirSelect(gCurrentFolder != "" ? "*" gCurrentFolder : "", 3, "選擇要篩選的資料夾")
+    gGui.Opt("+AlwaysOnTop")
+    if (sel != "") {
+        gCurrentFolder := sel
+        Refresh()
+        gEdit.Focus()
+    }
+}
+
 ; ===================== 掃描 / 過濾 =====================
 ScanItems() {
-    global gItems, gCurrentFolder, gChkSub, SCAN_CAP
-    gItems := []
+    global gItems, gCurrentFolder, gChkSub, SCAN_CAP, gScanTruncated
+    gItems := [], gScanTruncated := false
     if (gCurrentFolder = "" || !DirExist(gCurrentFolder))
         return
     rec := gChkSub.Value
-    Loop Files, gCurrentFolder "\*", rec ? "DR" : "D" {
-        AddItem(A_LoopFileFullPath, true, -1, A_LoopFileTimeModified, A_LoopFileTimeCreated, rec)
-        if (gItems.Length >= SCAN_CAP)
+    Loop Files, gCurrentFolder "\*", rec ? "FDR" : "FD" {
+        isDir := InStr(A_LoopFileAttrib, "D") ? true : false
+        AddItem(A_LoopFileFullPath, isDir, isDir ? -1 : A_LoopFileSize,
+            A_LoopFileTimeModified, A_LoopFileTimeCreated, rec)
+        if (gItems.Length >= SCAN_CAP) {
+            gScanTruncated := true
             break
-    }
-    Loop Files, gCurrentFolder "\*", rec ? "FR" : "F" {
-        AddItem(A_LoopFileFullPath, false, A_LoopFileSize, A_LoopFileTimeModified, A_LoopFileTimeCreated, rec)
-        if (gItems.Length >= SCAN_CAP)
-            break
+        }
     }
 }
 
@@ -286,35 +355,44 @@ AddItem(fullPath, isDir, size, mtime, ctime, rec) {
     gItems.Push({ name: nm, rel: rel, ext: ext, size: size, isDir: isDir, mtime: mtime, ctime: ctime, path: fullPath })
 }
 
+ScheduleFilter() {
+    SetTimer(DoFilter, -180)   ; debounce：連續輸入只在停頓後跑一次
+}
+
 DoFilter() {
-    global gItems, gEdit, gLV, gStatus, gSortCol, SORT_CAP, DISP_CAP
+    global gItems, gEdit, gLV, gStatus, gSortCol, SORT_CAP, DISP_CAP, SCAN_CAP, gScanTruncated
     global gChkExc, gChkExclDir, gChkExclFile, gChkSmall, gChkBig, gChkOld, gChkNew
     global gEditKB, gEditKBBig, gEditDays, gEditDaysNew
+    SetTimer(DoFilter, 0)
     inc := [], exc := []
     globalExc := gChkExc.Value
     for t in StrSplit(Trim(gEdit.Value), A_Space) {
         if (t = "")
             continue
-        if (SubStr(t, 1, 1) = "-" && StrLen(t) > 1)
-            exc.Push(SubStr(t, 2))
-        else if globalExc
-            exc.Push(t)
+        neg := false
+        if (SubStr(t, 1, 1) = "-" && StrLen(t) > 1) {
+            neg := true
+            t := SubStr(t, 2)
+        }
+        d := BuildToken(t)
+        if (neg || globalExc)
+            exc.Push(d)
         else
-            inc.Push(t)
+            inc.Push(d)
     }
     exclDir := gChkExclDir.Value, exclFile := gChkExclFile.Value
     kbSmall := gChkSmall.Value ? NumVal(gEditKB, 0) : 0
     kbBig := gChkBig.Value ? NumVal(gEditKBBig, 0) : 0
     cutoffOld := "", cutoffNew := ""
     if (gChkOld.Value) {
-        d := NumVal(gEditDays, 0)
-        if (d > 0)
-            cutoffOld := DateAdd(A_Now, -d, "Days")
+        dd := NumVal(gEditDays, 0)
+        if (dd > 0)
+            cutoffOld := DateAdd(A_Now, -dd, "Days")
     }
     if (gChkNew.Value) {
-        d := NumVal(gEditDaysNew, 0)
-        if (d > 0)
-            cutoffNew := DateAdd(A_Now, -d, "Days")
+        dd := NumVal(gEditDaysNew, 0)
+        if (dd > 0)
+            cutoffNew := DateAdd(A_Now, -dd, "Days")
     }
 
     shown := []
@@ -332,15 +410,15 @@ DoFilter() {
         if (!item.isDir && cutoffNew != "" && item.mtime != "" && (item.mtime + 0) > (cutoffNew + 0))
             continue
         ok := true
-        for t in inc {
-            if !TokenMatch(item.name, t) {
+        for d in inc {
+            if !MatchTok(item.name, d) {
                 ok := false
                 break
             }
         }
         if ok {
-            for t in exc {
-                if TokenMatch(item.name, t) {
+            for d in exc {
+                if MatchTok(item.name, d) {
                     ok := false
                     break
                 }
@@ -349,7 +427,8 @@ DoFilter() {
         if ok
             shown.Push(item)
     }
-    if (shown.Length <= SORT_CAP)
+    sorted := (shown.Length <= SORT_CAP)
+    if sorted
         shown := MergeSort(shown, ItemCompare)
 
     gLV.Opt("-Redraw")
@@ -364,7 +443,13 @@ DoFilter() {
     gLV.Opt("+Redraw")
     if gLV.GetCount()
         gLV.Modify(1, "Select Focus")
-    note := (total > DISP_CAP) ? "（僅顯示前 " DISP_CAP " 筆，請輸入更精確關鍵字）" : ""
+    note := ""
+    if gScanTruncated
+        note .= "（已達掃描上限 " SCAN_CAP "，可能不完整）"
+    if !sorted
+        note .= "（超過 " SORT_CAP " 筆未排序）"
+    if (total > DISP_CAP)
+        note .= "（僅顯示前 " DISP_CAP " 筆）"
     gStatus.Value := "符合 " total " 筆" note "　|　Enter/雙擊 開啟 · F2 改名 · 右鍵 選單 · Del 刪除 · Esc 關閉"
     UpdateSelStatus()
 }
@@ -375,10 +460,16 @@ Refresh() {
     DoFilter()
 }
 
-TokenMatch(name, tok) {
-    if (InStr(tok, "*") || InStr(tok, "?"))
-        return RegExMatch(name, "i)^" GlobToRegex(tok) "$") > 0
-    return InStr(name, tok) > 0
+BuildToken(t) {
+    if (InStr(t, "*") || InStr(t, "?"))
+        return { rx: "i)^" GlobToRegex(t) "$" }
+    return { sub: t }
+}
+
+MatchTok(name, d) {
+    if d.HasOwnProp("rx")
+        return RegExMatch(name, d.rx) > 0
+    return InStr(name, d.sub) > 0
 }
 
 GlobToRegex(glob) {
@@ -520,7 +611,7 @@ FitAllCols() {
 }
 
 ; ===================== 選取 / 開啟 / 狀態列 =====================
-GetSelectedPaths() {
+GetSelectedPaths(focusFallback := true) {
     global gLV, COL_PATH
     paths := [], row := 0
     loop {
@@ -529,12 +620,24 @@ GetSelectedPaths() {
             break
         paths.Push(gLV.GetText(row, COL_PATH))
     }
-    if !paths.Length {
+    if (!paths.Length && focusFallback) {
         f := gLV.GetNext(0, "F")
         if f
             paths.Push(gLV.GetText(f, COL_PATH))
     }
     return paths
+}
+
+IsRowSelected(row) {
+    global gLV
+    r := 0
+    loop {
+        r := gLV.GetNext(r)
+        if !r
+            return false
+        if (r = row)
+            return true
+    }
 }
 
 UpdateSelStatus() {
@@ -558,7 +661,7 @@ UpdateSelStatus() {
 }
 
 OpenSelected() {
-    global gLV, gGui, COL_PATH
+    global gLV, COL_PATH
     row := gLV.GetNext(0, "F")
     if !row
         row := gLV.GetNext(0)
@@ -569,8 +672,26 @@ OpenSelected() {
     path := gLV.GetText(row, COL_PATH)
     if (path = "")
         return
-    try Run(path)
-    gGui.Hide()
+    try {
+        Run(path)
+        SaveOnHide()
+    } catch as e {
+        TopMsg("開啟失敗：`n" e.Message, "錯誤")
+    }
+}
+
+OpenContainingFolder() {
+    paths := GetSelectedPaths(true)
+    if !paths.Length
+        return
+    p := paths[1]
+    if !FileExist(p) {
+        TopMsg("路徑不存在：`n" p, "開啟路徑")
+        return
+    }
+    try Run('explorer.exe /select,"' p '"')
+    catch as e
+        TopMsg("開啟路徑失敗：`n" e.Message, "錯誤")
 }
 
 MoveSel(dir) {
@@ -610,6 +731,10 @@ RenameSelected() {
     newName := Trim(ib.Value)
     if (newName = "" || newName = nm)
         return
+    if !ValidName(newName) {
+        TopMsg("名稱不合法：不可含 \ / : * ? `" < > | 或控制字元、保留裝置名（CON/PRN/AUX/NUL/COM1…），結尾不可為空白或句點。", "重新命名")
+        return
+    }
     newPath := dir "\" newName
     if FileExist(newPath) {
         TopMsg("已存在同名項目，無法命名。", "重新命名")
@@ -627,25 +752,53 @@ RenameSelected() {
     Refresh()
 }
 
+ValidName(name) {
+    if (name = "")
+        return false
+    if RegExMatch(name, '[\\/:*?"<>|]')
+        return false
+    if RegExMatch(name, "[\x00-\x1F]")
+        return false
+    if RegExMatch(name, "[ .]$")
+        return false
+    SplitPath(name, , , , &base)
+    if RegExMatch(base, "i)^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$")
+        return false
+    return true
+}
+
 ; ===================== 右鍵選單 / 檔案操作 =====================
 ShowCtxMenu(LV, Item, IsRightClick, X, Y) {
+    global gLV
+    onEmpty := (Item = 0)
+    if (Item > 0 && !IsRowSelected(Item)) {
+        gLV.Modify(0, "-Select")
+        gLV.Modify(Item, "Select Focus")
+        UpdateSelStatus()
+    }
     m := Menu()
-    m.Add("開啟", (*) => OpenSelected())
-    m.Add("重新命名`tF2", (*) => RenameSelected())
-    m.Add()
-    m.Add("複製路徑", (*) => CopyPathText())
-    m.Add("複製`tCtrl+C", (*) => ClipFiles(false))
-    m.Add("剪下`tCtrl+X", (*) => ClipFiles(true))
+    if !onEmpty {
+        m.Add("開啟", (*) => OpenSelected())
+        m.Add("重新命名`tF2", (*) => RenameSelected())
+        m.Add()
+        m.Add("複製路徑", (*) => CopyPathText())
+        m.Add("開啟路徑", (*) => OpenContainingFolder())
+        m.Add()
+        m.Add("複製`tCtrl+C", (*) => ClipFiles(false))
+        m.Add("剪下`tCtrl+X", (*) => ClipFiles(true))
+    }
     m.Add("貼上`tCtrl+V", (*) => PasteFiles())
-    m.Add()
-    m.Add("刪除`tDel", (*) => DeleteSelected())
+    if !onEmpty {
+        m.Add()
+        m.Add("刪除`tDel", (*) => DeleteSelected())
+    }
     m.Add()
     m.Add("自動調整所有欄位寬度", (*) => FitAllCols())
     m.Show()
 }
 
 CopyPathText() {
-    paths := GetSelectedPaths()
+    paths := GetSelectedPaths(true)
     if !paths.Length
         return
     s := ""
@@ -656,11 +809,13 @@ CopyPathText() {
 }
 
 ClipFiles(cut) {
-    paths := GetSelectedPaths()
+    paths := GetSelectedPaths(false)
     if !paths.Length
         return
     if PutFilesOnClipboard(paths, cut)
         Tip((cut ? "已剪下 " : "已複製 ") paths.Length " 個項目")
+    else
+        TopMsg("放入剪貼簿失敗。", "錯誤")
 }
 
 PasteFiles() {
@@ -670,27 +825,48 @@ PasteFiles() {
 }
 
 DeleteSelected() {
-    paths := GetSelectedPaths()
+    paths := GetSelectedPaths(false)
     if !paths.Length
         return
     if (TopMsg("確定將選取的 " paths.Length " 個項目移到資源回收筒?", "刪除", "YesNo Icon?") != "Yes")
         return
+    errs := []
     for p in paths {
         try
             FileRecycle(p)
         catch as e
-            TopMsg("刪除失敗：" p "`n" e.Message, "錯誤")
+            errs.Push(p " — " e.Message)
     }
+    if errs.Length
+        TopMsg("以下 " errs.Length " 項刪除失敗：`n" JoinN(errs, 12), "刪除")
     Refresh()
 }
 
+JoinN(arr, max) {
+    s := "", n := 0
+    for x in arr {
+        if (++n > max) {
+            s .= "`n…（其餘 " (arr.Length - max) " 項略）"
+            break
+        }
+        s .= (s = "" ? "" : "`n") x
+    }
+    return s
+}
+
 PutFilesOnClipboard(paths, cut := false) {
-    CF_HDROP := 15, GHND := 0x0042
+    global CF_HDROP, GHND
     chars := 1
     for p in paths
         chars += StrLen(p) + 1
     hMem := DllCall("GlobalAlloc", "UInt", GHND, "Ptr", 20 + chars * 2, "Ptr")
+    if !hMem
+        return false
     pMem := DllCall("GlobalLock", "Ptr", hMem, "Ptr")
+    if !pMem {
+        DllCall("GlobalFree", "Ptr", hMem)
+        return false
+    }
     NumPut("UInt", 20, pMem, 0)
     NumPut("Int", 1, pMem, 16)
     off := 20
@@ -699,22 +875,33 @@ PutFilesOnClipboard(paths, cut := false) {
         off += (StrLen(p) + 1) * 2
     }
     DllCall("GlobalUnlock", "Ptr", hMem)
-    if !DllCall("OpenClipboard", "Ptr", A_ScriptHwnd)
-        return false
-    DllCall("EmptyClipboard")
-    DllCall("SetClipboardData", "UInt", CF_HDROP, "Ptr", hMem)
-    cf := DllCall("RegisterClipboardFormat", "Str", "Preferred DropEffect", "UInt")
     hEff := DllCall("GlobalAlloc", "UInt", GHND, "Ptr", 4, "Ptr")
-    pEff := DllCall("GlobalLock", "Ptr", hEff, "Ptr")
-    NumPut("UInt", cut ? 2 : 1, pEff, 0)
-    DllCall("GlobalUnlock", "Ptr", hEff)
-    DllCall("SetClipboardData", "UInt", cf, "Ptr", hEff)
+    if hEff {
+        pEff := DllCall("GlobalLock", "Ptr", hEff, "Ptr")
+        NumPut("UInt", cut ? 2 : 1, pEff, 0)
+        DllCall("GlobalUnlock", "Ptr", hEff)
+    }
+    if !DllCall("OpenClipboard", "Ptr", A_ScriptHwnd) {
+        DllCall("GlobalFree", "Ptr", hMem)
+        if hEff
+            DllCall("GlobalFree", "Ptr", hEff)
+        return false
+    }
+    DllCall("EmptyClipboard")
+    okDrop := DllCall("SetClipboardData", "UInt", CF_HDROP, "Ptr", hMem, "Ptr")
+    if !okDrop
+        DllCall("GlobalFree", "Ptr", hMem)
+    if hEff {
+        cf := DllCall("RegisterClipboardFormat", "Str", "Preferred DropEffect", "UInt")
+        if !DllCall("SetClipboardData", "UInt", cf, "Ptr", hEff, "Ptr")
+            DllCall("GlobalFree", "Ptr", hEff)
+    }
     DllCall("CloseClipboard")
-    return true
+    return okDrop ? true : false
 }
 
 PasteFilesToFolder(destDir) {
-    CF_HDROP := 15
+    global CF_HDROP
     if (destDir = "" || !DirExist(destDir))
         return 0
     if !DllCall("OpenClipboard", "Ptr", A_ScriptHwnd)
@@ -745,42 +932,63 @@ PasteFilesToFolder(destDir) {
         files.Push(StrGet(buf, "UTF-16"))
     }
     DllCall("CloseClipboard")
-    move := (effect = 2), done := 0
+    move := (effect = 2), done := 0, errs := []
+    nd := RTrim(destDir, "\"), ndLo := StrLower(nd)
     for f in files {
         SplitPath(f, &nm)
-        dest := destDir "\" nm
+        srcIsDir := InStr(FileExist(f), "D") ? true : false
+        nf := RTrim(f, "\"), nfLo := StrLower(nf)
+        if (srcIsDir && (ndLo = nfLo || SubStr(ndLo "\", 1, StrLen(nfLo) + 1) = nfLo "\")) {
+            errs.Push(nm " — 不能貼到自身或其子資料夾")
+            continue
+        }
+        dest := nd "\" nm
         if (dest = f) {
             if move
                 continue
-            dest := UniqueDest(destDir, nm)
+            dest := UniqueDest(nd, nm)
         } else if FileExist(dest)
-            dest := UniqueDest(destDir, nm)
+            dest := UniqueDest(nd, nm)
+        if (dest = "") {
+            errs.Push(nm " — 無法產生唯一名稱")
+            continue
+        }
         try {
-            isDir := InStr(FileExist(f), "D")
             if move
-                isDir ? DirMove(f, dest, 1) : FileMove(f, dest, 1)
+                srcIsDir ? DirMove(f, dest, 0) : FileMove(f, dest, 0)
             else
-                isDir ? DirCopy(f, dest, 1) : FileCopy(f, dest, 1)
+                srcIsDir ? DirCopy(f, dest, 0) : FileCopy(f, dest, 0)
             done++
         } catch as e {
-            TopMsg("貼上失敗：" nm "`n" e.Message, "錯誤")
+            errs.Push(nm " — " e.Message)
         }
     }
+    if (move && done > 0)
+        ClearClipboard()
+    if errs.Length
+        TopMsg("以下 " errs.Length " 項貼上失敗：`n" JoinN(errs, 12), "貼上")
     if done
         Tip((move ? "已移動 " : "已貼上 ") done " 個項目")
     return done
 }
 
+ClearClipboard() {
+    if DllCall("OpenClipboard", "Ptr", A_ScriptHwnd) {
+        DllCall("EmptyClipboard")
+        DllCall("CloseClipboard")
+    }
+}
+
 UniqueDest(dir, name) {
     SplitPath(name, , , &ext, &base)
     i := 2
-    loop {
+    loop 9999 {
         cand := dir "\" base " (" i ")" (ext != "" ? "." ext : "")
         if !FileExist(cand)
             return cand
-        if (++i > 9999)
-            return dir "\" name
+        i++
     }
+    return ""
 }
 
 ; ===================== 截圖 =====================
@@ -833,68 +1041,121 @@ ShortcutClick(i, *) {
     gEdit.Focus()
 }
 
-RefreshShortcutButtons() {
-    global gScBtns
-    if !gScBtns.Length
-        return
-    loop 10
-        gScBtns[A_Index].Text := ShortcutLabel(A_Index)
-}
-
 ; ===================== 設定視窗 =====================
 ShowSettings() {
-    global gGui, gHotkey, gShortcuts
-    ownerOpt := (gGui ? "+Owner" gGui.Hwnd " " : "") "+AlwaysOnTop +ToolWindow"
-    s := Gui(ownerOpt, "設定")
-    s.SetFont("s10", "Segoe UI")
+    global gSetState, gShortcuts, gHotkey
+    gSetState := { hotkey: gHotkey, autostart: IsAutoStart(), items: [] }
+    for sc in gShortcuts
+        gSetState.items.Push({ name: sc.name, path: sc.path })
+    RenderSettings()
+}
 
-    s.AddText("xm", "啟動熱鍵（點欄位後直接按組合鍵）：")
-    hk := s.AddHotkey("xm w220", gHotkey)
-    auto := s.AddCheckbox("xm y+12", "開機時自動載入")
-    auto.Value := IsAutoStart() ? 1 : 0
+RenderSettings() {
+    global gSetGui, gSetState, gSetHk, gSetAuto, gSetNames, gSetPaths, gGui
+    if gSetGui {
+        try gSetGui.Destroy()
+        gSetGui := 0
+    }
+    own := (gGui ? "+Owner" gGui.Hwnd " " : "") "+AlwaysOnTop +ToolWindow"
+    gSetGui := Gui(own, "設定")
+    gSetGui.SetFont("s10", "Segoe UI")
 
-    s.AddText("xm y+14", "自訂捷徑（名稱可留空；點主視窗按鈕即切換目錄）：")
-    nameEdits := [], pathEdits := []
-    loop 10 {
+    gSetGui.AddText("xm", "啟動熱鍵（點欄位後直接按組合鍵）：")
+    gSetHk := gSetGui.AddHotkey("xm w220", gSetState.hotkey)
+    gSetAuto := gSetGui.AddCheckbox("xm y+10", "開機時自動載入")
+    gSetAuto.Value := gSetState.autostart ? 1 : 0
+
+    gSetGui.AddText("xm y+14", "自訂捷徑（最少 10 組；點主視窗按鈕即切換目錄）：")
+    btnAdd := gSetGui.AddButton("xm y+4 w96", "＋ 新增一組")
+    btnDel := gSetGui.AddButton("x+8 yp w96", "－ 刪除一組")
+    gSetGui.AddText("x+12 yp+5", "目前 " gSetState.items.Length " 組")
+    btnAdd.OnEvent("Click", (*) => SettingsAddRow())
+    btnDel.OnEvent("Click", (*) => SettingsDelRow())
+
+    gSetNames := [], gSetPaths := []
+    loop gSetState.items.Length {
         i := A_Index
-        s.AddText("xm y+6 w46 h24 +0x200", "捷徑" i)
-        ne := s.AddEdit("x+4 yp w120", gShortcuts[i].name)
-        pe := s.AddEdit("x+6 yp w320", gShortcuts[i].path)
-        br := s.AddButton("x+6 yp-1 w60 h24", "瀏覽")
+        gSetGui.AddText("xm y+6 w46 h24 +0x200", "捷徑" i)
+        ne := gSetGui.AddEdit("x+4 yp w120", gSetState.items[i].name)
+        pe := gSetGui.AddEdit("x+6 yp w300", gSetState.items[i].path)
+        br := gSetGui.AddButton("x+6 yp-1 w56 h24", "瀏覽")
         br.OnEvent("Click", BrowseFor.Bind(pe))
-        nameEdits.Push(ne), pathEdits.Push(pe)
+        gSetNames.Push(ne), gSetPaths.Push(pe)
     }
 
-    ok := s.AddButton("xm y+16 w90 Default", "確定")
-    cancel := s.AddButton("x+10 yp w90", "取消")
-    ok.OnEvent("Click", (*) => SaveSettings(s, hk, auto, nameEdits, pathEdits))
-    cancel.OnEvent("Click", (*) => s.Destroy())
-    s.OnEvent("Escape", (*) => s.Destroy())
-    s.Show()
+    ok := gSetGui.AddButton("xm y+16 w90 Default", "確定")
+    cancel := gSetGui.AddButton("x+10 yp w90", "取消")
+    ok.OnEvent("Click", (*) => SaveSettings())
+    cancel.OnEvent("Click", (*) => gSetGui.Destroy())
+    gSetGui.OnEvent("Escape", (*) => gSetGui.Destroy())
+    gSetGui.Show()
+}
+
+CaptureSettings() {
+    global gSetState, gSetHk, gSetAuto, gSetNames, gSetPaths
+    if (gSetHk.Value != "")
+        gSetState.hotkey := gSetHk.Value
+    gSetState.autostart := gSetAuto.Value
+    loop gSetState.items.Length {
+        gSetState.items[A_Index].name := Trim(gSetNames[A_Index].Value)
+        gSetState.items[A_Index].path := Trim(gSetPaths[A_Index].Value)
+    }
+}
+
+SettingsAddRow() {
+    global gSetState
+    CaptureSettings()
+    gSetState.items.Push({ name: "", path: "" })
+    RenderSettings()
+}
+
+SettingsDelRow() {
+    global gSetState
+    CaptureSettings()
+    if (gSetState.items.Length > 10)
+        gSetState.items.Pop()
+    else
+        Tip("最少需保留 10 組")
+    RenderSettings()
 }
 
 BrowseFor(pe, *) {
+    global gSetGui
+    if gSetGui
+        gSetGui.Opt("-AlwaysOnTop")
     sel := DirSelect(pe.Value != "" ? "*" pe.Value : "", 3, "選擇資料夾")
+    if gSetGui
+        gSetGui.Opt("+AlwaysOnTop")
     if (sel != "")
         pe.Value := sel
 }
 
-SaveSettings(s, hk, auto, nameEdits, pathEdits) {
-    global gHotkey, gShortcuts
-    newHk := hk.Value
-    if (newHk != "" && newHk != gHotkey) {
-        gHotkey := newHk
+SaveSettings() {
+    global gSetState, gSetGui, gShortcuts, gHotkey, gGui, gEdit
+    CaptureSettings()
+    if (gSetState.hotkey != "" && gSetState.hotkey != gHotkey) {
+        gHotkey := gSetState.hotkey
         RegisterHotkey()
     }
-    SetAutoStart(auto.Value)
-    loop 10 {
-        gShortcuts[A_Index].name := Trim(nameEdits[A_Index].Value)
-        gShortcuts[A_Index].path := Trim(pathEdits[A_Index].Value)
-    }
+    SetAutoStart(gSetState.autostart)
+    gShortcuts := []
+    for it in gSetState.items
+        gShortcuts.Push({ name: it.name, path: it.path })
     SaveConfig()
-    RefreshShortcutButtons()
-    s.Destroy()
+    gSetGui.Destroy()
     Tip("設定已儲存")
+    if gGui {
+        wasVisible := DllCall("IsWindowVisible", "Ptr", gGui.Hwnd)
+        SaveUIState()
+        BuildGui()
+        if wasVisible {
+            ScanItems()
+            UpdatePathText()
+            DoFilter()
+            ShowGui()
+            gEdit.Focus()
+        }
+    }
 }
 
 ; ===================== 共用 =====================
