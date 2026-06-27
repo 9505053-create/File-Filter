@@ -2,7 +2,7 @@
 #SingleInstance Force
 
 ; =====================================================================
-;  資料夾即時篩選器 (FolderFilter)  v1.1
+;  資料夾即時篩選器 (FolderFilter)  v1.1.1
 ;  熱鍵（可在設定中變更，預設 Ctrl+Alt+F）：對目前檔案總管資料夾叫出篩選視窗
 ;
 ;  v1.1 變更（依 3CLI 審查）：
@@ -42,7 +42,7 @@ global gSt := Map("filter", "", "sub", 0, "exc", 0, "exclDir", 0, "exclFile", 0,
 global gSetGui := 0, gSetState := 0, gSetHk := 0, gSetAuto := 0, gSetNames := [], gSetPaths := []
 
 LoadConfig()
-RegisterHotkey()
+RegisterHotkey(gHotkey)
 OnMessage(0x7B, OnHeaderContext)   ; 標題列右鍵調整欄寬
 A_TrayMenu.Add("設定", (*) => ShowSettings())
 A_TrayMenu.Add("離開", (*) => ExitApp())
@@ -64,30 +64,26 @@ LoadConfig() {
 SaveConfig() {
     global gHotkey, gShortcuts, INI
     IniWrite(gHotkey, INI, "General", "Hotkey")
+    try IniDelete(INI, "Shortcuts")   ; 清掉整段重寫，避免殘留舊列
     IniWrite(gShortcuts.Length, INI, "Shortcuts", "Count")
     loop gShortcuts.Length {
         IniWrite(gShortcuts[A_Index].name, INI, "Shortcuts", A_Index "Name")
         IniWrite(gShortcuts[A_Index].path, INI, "Shortcuts", A_Index "Path")
     }
-    i := gShortcuts.Length + 1
-    loop 50 {
-        try IniDelete(INI, "Shortcuts", i "Name")
-        try IniDelete(INI, "Shortcuts", i "Path")
-        i++
-    }
 }
 
-RegisterHotkey() {
-    global gHotkey, gHotkeyActive
-    if (gHotkeyActive != "") {
-        try Hotkey(gHotkeyActive, "Off")
-    }
+RegisterHotkey(newKey) {
+    global gHotkeyActive
     try {
-        Hotkey(gHotkey, (*) => ShowFilter(), "On")
-        gHotkeyActive := gHotkey
+        Hotkey(newKey, (*) => ShowFilter(), "On")   ; 先確認新熱鍵註冊成功
     } catch as e {
-        TopMsg("熱鍵註冊失敗：" gHotkey "`n" e.Message, "錯誤")
+        TopMsg("熱鍵註冊失敗：" newKey "`n" e.Message, "錯誤")
+        return false
     }
+    if (gHotkeyActive != "" && gHotkeyActive != newKey)
+        try Hotkey(gHotkeyActive, "Off")            ; 成功後才停用舊的
+    gHotkeyActive := newKey
+    return true
 }
 
 IsAutoStart() {
@@ -224,6 +220,10 @@ BuildGui() {
     gLV.ModifyCol(5, 120)
     gLV.ModifyCol(6, 120)
     gLV.ModifyCol(7, 0)
+    if gSt.Has("cols") {
+        loop 6
+            gLV.ModifyCol(A_Index, gSt["cols"][A_Index])
+    }
     gLV.OnEvent("DoubleClick", (*) => OpenSelected())
     gLV.OnEvent("ContextMenu", ShowCtxMenu)
     gLV.OnEvent("ColClick", OnColClick)
@@ -250,14 +250,22 @@ SaveOnHide() {
 }
 
 SaveUIState() {
-    global gGui, gSt, gEdit, gChkSub, gChkExc, gChkExclDir, gChkExclFile
+    global gGui, gSt, gLV, gEdit, gChkSub, gChkExc, gChkExclDir, gChkExclFile
     global gChkSmall, gChkBig, gChkOld, gChkNew, gEditKB, gEditKBBig, gEditDays, gEditDaysNew
     if !gGui
         return
+    if (WinGetMinMax("ahk_id " gGui.Hwnd) = 0) {   ; 只在一般視窗狀態存位置/大小，避免最小化/最大化座標
+        try {
+            gGui.GetClientPos(, , &cw, &ch)
+            WinGetPos(&wx, &wy, , , "ahk_id " gGui.Hwnd)
+            gSt["x"] := wx, gSt["y"] := wy, gSt["w"] := cw, gSt["h"] := ch
+        }
+    }
     try {
-        gGui.GetClientPos(, , &cw, &ch)
-        WinGetPos(&wx, &wy, , , "ahk_id " gGui.Hwnd)
-        gSt["x"] := wx, gSt["y"] := wy, gSt["w"] := cw, gSt["h"] := ch
+        cols := []
+        loop 6
+            cols.Push(SendMessage(0x101D, A_Index - 1, 0, gLV.Hwnd))
+        gSt["cols"] := cols
     }
     gSt["filter"] := gEdit.Value
     gSt["sub"] := gChkSub.Value, gSt["exc"] := gChkExc.Value
@@ -351,7 +359,11 @@ AddItem(fullPath, isDir, size, mtime, ctime, rec) {
     SplitPath(fullPath, &nm, , &ext)
     if isDir
         ext := ""
-    rel := rec ? SubStr(fullPath, StrLen(gCurrentFolder) + 2) : nm
+    if rec {
+        sep := (SubStr(gCurrentFolder, -1) = "\") ? StrLen(gCurrentFolder) + 1 : StrLen(gCurrentFolder) + 2
+        rel := SubStr(fullPath, sep)
+    } else
+        rel := nm
     gItems.Push({ name: nm, rel: rel, ext: ext, size: size, isDir: isDir, mtime: mtime, ctime: ctime, path: fullPath })
 }
 
@@ -411,14 +423,14 @@ DoFilter() {
             continue
         ok := true
         for d in inc {
-            if !MatchTok(item.name, d) {
+            if !MatchTok(item.rel, d) {   ; rel：遞迴模式可比對到子路徑；平面模式 rel==name
                 ok := false
                 break
             }
         }
         if ok {
             for d in exc {
-                if MatchTok(item.name, d) {
+                if MatchTok(item.rel, d) {
                     ok := false
                     break
                 }
@@ -729,19 +741,30 @@ RenameSelected() {
     if (ib.Result != "OK")
         return
     newName := Trim(ib.Value)
-    if (newName = "" || newName = nm)
+    if (newName = "" || newName == nm)   ; == 區分大小寫：純改大小寫仍需處理
         return
     if !ValidName(newName) {
         TopMsg("名稱不合法：不可含 \ / : * ? `" < > | 或控制字元、保留裝置名（CON/PRN/AUX/NUL/COM1…），結尾不可為空白或句點。", "重新命名")
         return
     }
     newPath := dir "\" newName
-    if FileExist(newPath) {
+    caseOnly := (StrLower(newName) = StrLower(nm))
+    if (!caseOnly && FileExist(newPath)) {
         TopMsg("已存在同名項目，無法命名。", "重新命名")
         return
     }
+    isDir := InStr(FileExist(path), "D") ? true : false
     try {
-        if InStr(FileExist(path), "D")
+        if caseOnly {
+            tmp := dir "\" nm ".__rn" A_TickCount   ; 純大小寫變更：經暫存名兩段式改名
+            if isDir {
+                DirMove(path, tmp, "R")
+                DirMove(tmp, newPath, "R")
+            } else {
+                FileMove(path, tmp, 0)
+                FileMove(tmp, newPath, 0)
+            }
+        } else if isDir
             DirMove(path, newPath, "R")
         else
             FileMove(path, newPath, 0)
@@ -878,8 +901,13 @@ PutFilesOnClipboard(paths, cut := false) {
     hEff := DllCall("GlobalAlloc", "UInt", GHND, "Ptr", 4, "Ptr")
     if hEff {
         pEff := DllCall("GlobalLock", "Ptr", hEff, "Ptr")
-        NumPut("UInt", cut ? 2 : 1, pEff, 0)
-        DllCall("GlobalUnlock", "Ptr", hEff)
+        if pEff {
+            NumPut("UInt", cut ? 2 : 1, pEff, 0)
+            DllCall("GlobalUnlock", "Ptr", hEff)
+        } else {
+            DllCall("GlobalFree", "Ptr", hEff)
+            hEff := 0
+        }
     }
     if !DllCall("OpenClipboard", "Ptr", A_ScriptHwnd) {
         DllCall("GlobalFree", "Ptr", hMem)
@@ -963,7 +991,7 @@ PasteFilesToFolder(destDir) {
             errs.Push(nm " — " e.Message)
         }
     }
-    if (move && done > 0)
+    if (move && done > 0 && !errs.Length)   ; 只有全部成功才清剪貼簿，保留部分失敗的重試路徑
         ClearClipboard()
     if errs.Length
         TopMsg("以下 " errs.Length " 項貼上失敗：`n" JoinN(errs, 12), "貼上")
@@ -1105,6 +1133,11 @@ CaptureSettings() {
 SettingsAddRow() {
     global gSetState
     CaptureSettings()
+    if (gSetState.items.Length >= 30) {
+        Tip("捷徑最多 30 組")
+        RenderSettings()
+        return
+    }
     gSetState.items.Push({ name: "", path: "" })
     RenderSettings()
 }
@@ -1134,8 +1167,8 @@ SaveSettings() {
     global gSetState, gSetGui, gShortcuts, gHotkey, gGui, gEdit
     CaptureSettings()
     if (gSetState.hotkey != "" && gSetState.hotkey != gHotkey) {
-        gHotkey := gSetState.hotkey
-        RegisterHotkey()
+        if RegisterHotkey(gSetState.hotkey)   ; 只有註冊成功才更新並寫入
+            gHotkey := gSetState.hotkey
     }
     SetAutoStart(gSetState.autostart)
     gShortcuts := []
@@ -1163,9 +1196,7 @@ ListFocused() {
     global gLV
     if !gLV
         return false
-    try return ControlGetFocus("A") = gLV.Hwnd
-    catch
-        return false
+    return DllCall("GetFocus", "Ptr") = gLV.Hwnd
 }
 
 TopMsg(text, title := "提示", opt := "") {
