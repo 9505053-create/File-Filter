@@ -2,7 +2,7 @@
 #SingleInstance Force
 
 ; =====================================================================
-;  資料夾即時篩選器 (FolderFilter)  v1.1.1
+;  資料夾即時篩選器 (FolderFilter)  v1.1.2
 ;  熱鍵（可在設定中變更，預設 Ctrl+Alt+F）：對目前檔案總管資料夾叫出篩選視窗
 ;
 ;  v1.1 變更（依 3CLI 審查）：
@@ -26,13 +26,14 @@ global gChkSub := 0, gChkExc := 0, gChkExclDir := 0, gChkExclFile := 0
 global gChkSmall := 0, gChkBig := 0, gChkOld := 0, gChkNew := 0
 global gEditKB := 0, gEditKBBig := 0, gEditDays := 0, gEditDaysNew := 0
 global gScBtns := [], gShortTop := 0, gSBH := 24, gHeaderHwnd := 0
-global gSortCol := 0, gSortDir := 1
+global gSortCol := 0, gSortDir := 1, gFilterPending := false
 global gHotkey := "^!f", gHotkeyActive := "", gShortcuts := []
 global COL_PATH := 7     ; 名稱1 副檔名2 大小3 類型4 修改5 建立6 路徑7(隱藏)
 global CF_HDROP := 15, GHND := 0x0042
 global INI := A_ScriptDir "\FolderFilter.ini"
 global RUNKEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run", RUNVAL := "FolderFilter"
 global SCAN_CAP := 200000, SORT_CAP := 20000, DISP_CAP := 5000
+global VER := "1.1.2"
 ; 重開保留的 UI 狀態
 global gSt := Map("filter", "", "sub", 0, "exc", 0, "exclDir", 0, "exclFile", 0,
     "small", 0, "big", 0, "old", 0, "new", 0,
@@ -144,7 +145,7 @@ GetActiveExplorerPath() {
 }
 
 BuildGui() {
-    global gGui, gEdit, gLV, gPathTxt, gStatus, gSB, gSt
+    global gGui, gEdit, gLV, gPathTxt, gStatus, gSB, gSt, VER
     global gChkSub, gChkExc, gChkExclDir, gChkExclFile
     global gChkSmall, gChkBig, gChkOld, gChkNew, gEditKB, gEditKBBig, gEditDays, gEditDaysNew
     global gScBtns, gShortTop, gSBH, gHeaderHwnd
@@ -153,7 +154,7 @@ BuildGui() {
         try gGui.Destroy()
         gGui := 0
     }
-    gGui := Gui("+AlwaysOnTop +Resize +MinSize640x500", "資料夾篩選")
+    gGui := Gui("+AlwaysOnTop +Resize +MinSize640x500", "資料夾篩選  v" VER)
     gGui.SetFont("s10", "Segoe UI")
     gGui.MarginX := 10, gGui.MarginY := 10
 
@@ -368,14 +369,23 @@ AddItem(fullPath, isDir, size, mtime, ctime, rec) {
 }
 
 ScheduleFilter() {
+    global gFilterPending
+    gFilterPending := true
     SetTimer(DoFilter, -180)   ; debounce：連續輸入只在停頓後跑一次
 }
 
+FlushFilter() {
+    global gFilterPending
+    if gFilterPending
+        DoFilter()   ; 立即套用待處理的延遲過濾（避免打字後馬上 Enter 開到尚未過濾的舊清單）
+}
+
 DoFilter() {
-    global gItems, gEdit, gLV, gStatus, gSortCol, SORT_CAP, DISP_CAP, SCAN_CAP, gScanTruncated
+    global gItems, gEdit, gLV, gStatus, gSortCol, SORT_CAP, DISP_CAP, SCAN_CAP, gScanTruncated, gFilterPending, VER
     global gChkExc, gChkExclDir, gChkExclFile, gChkSmall, gChkBig, gChkOld, gChkNew
     global gEditKB, gEditKBBig, gEditDays, gEditDaysNew
     SetTimer(DoFilter, 0)
+    gFilterPending := false
     inc := [], exc := []
     globalExc := gChkExc.Value
     for t in StrSplit(Trim(gEdit.Value), A_Space) {
@@ -454,7 +464,7 @@ DoFilter() {
     }
     gLV.Opt("+Redraw")
     if gLV.GetCount()
-        gLV.Modify(1, "Select Focus")
+        gLV.Modify(1, "Select")   ; 只選取、不設項目焦點：避免 debounce 計時器把鍵盤焦點搶到清單，鍵盤焦點留在輸入框
     note := ""
     if gScanTruncated
         note .= "（已達掃描上限 " SCAN_CAP "，可能不完整）"
@@ -462,7 +472,7 @@ DoFilter() {
         note .= "（超過 " SORT_CAP " 筆未排序）"
     if (total > DISP_CAP)
         note .= "（僅顯示前 " DISP_CAP " 筆）"
-    gStatus.Value := "符合 " total " 筆" note "　|　Enter/雙擊 開啟 · F2 改名 · 右鍵 選單 · Del 刪除 · Esc 關閉"
+    gStatus.Value := "符合 " total " 筆" note "　|　Enter/雙擊 開啟 · F2 改名 · 右鍵 選單 · Del 刪除 · Esc 關閉　|　v" VER
     UpdateSelStatus()
 }
 
@@ -674,6 +684,7 @@ UpdateSelStatus() {
 
 OpenSelected() {
     global gLV, COL_PATH
+    FlushFilter()   ; 確保 Enter 開到的是當前關鍵字過濾後的結果
     row := gLV.GetNext(0, "F")
     if !row
         row := gLV.GetNext(0)
@@ -708,6 +719,7 @@ OpenContainingFolder() {
 
 MoveSel(dir) {
     global gLV
+    FlushFilter()
     cnt := gLV.GetCount()
     if !cnt
         return
@@ -1199,6 +1211,19 @@ ListFocused() {
     return DllCall("GetFocus", "Ptr") = gLV.Hwnd
 }
 
+; IME 是否正在組字（自然輸入法等中文輸入時，Enter/上下鍵應讓給 IME）
+IMEComposing() {
+    hwnd := DllCall("GetFocus", "Ptr")
+    if !hwnd
+        return false
+    himc := DllCall("imm32\ImmGetContext", "Ptr", hwnd, "Ptr")
+    if !himc
+        return false
+    len := DllCall("imm32\ImmGetCompositionStringW", "Ptr", himc, "UInt", 0x0008, "Ptr", 0, "UInt", 0)   ; GCS_COMPSTR
+    DllCall("imm32\ImmReleaseContext", "Ptr", hwnd, "Ptr", himc)
+    return (len > 0)
+}
+
 TopMsg(text, title := "提示", opt := "") {
     return MsgBox(text, title, Trim(opt " 0x40000"))
 }
@@ -1208,8 +1233,8 @@ Tip(msg) {
     SetTimer(() => ToolTip(), -1500)
 }
 
-; ==== 視窗作用中：方向鍵 / Enter / F2 ====
-#HotIf gGui && WinActive("ahk_id " gGui.Hwnd)
+; ==== 視窗作用中（且 IME 沒在組字）：方向鍵 / Enter / F2 ====
+#HotIf gGui && WinActive("ahk_id " gGui.Hwnd) && !IMEComposing()
 *Up::MoveSel(-1)
 *Down::MoveSel(1)
 Enter::OpenSelected()
