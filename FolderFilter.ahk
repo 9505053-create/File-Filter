@@ -38,7 +38,7 @@ global CF_HDROP := 15, GHND := 0x0042
 global INI := A_ScriptDir "\FolderFilter.ini"
 global RUNKEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run", RUNVAL := "FolderFilter"
 global SCAN_CAP := 200000, SORT_CAP := 20000, DISP_CAP := 5000
-global VER := "1.2.0"
+global VER := "1.2.1"
 ; 重開保留的 UI 狀態
 global gSt := Map("filter", "", "sub", 0, "exc", 0, "exclDir", 0, "exclFile", 0,
     "small", 0, "big", 0, "old", 0, "new", 0,
@@ -154,7 +154,7 @@ GetActiveExplorerPath() {
 
 BuildGui() {
     global gGui, gEdit, gLV, gPathTxt, gStatus, gSB, gSt, VER
-    global gChkSub, gChkExc, gChkExclDir, gChkExclFile
+    global gChkSub, gChkExc, gChkExclDir, gChkExclFile, gChkTop
     global gChkSmall, gChkBig, gChkOld, gChkNew, gEditKB, gEditKBBig, gEditDays, gEditDaysNew
     global gScBtns, gShortTop, gSBH, gHeaderHwnd
     if gGui {
