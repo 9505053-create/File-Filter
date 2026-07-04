@@ -18,11 +18,16 @@
 ;  v1.1 新功能：
 ;   - 右鍵選單「複製路徑」下方新增「開啟路徑」（在檔案總管定位該項目）
 ;   - 捷徑數量可在設定中增減（最少 10 組）
+;  v1.2 變更：
+;   - 新增「最上層顯示」勾選開關（預設開，記憶於 INI）
+;   - 捷徑按鈕：雙擊＝在檔案總管開啟該資料夾；右鍵＝選單（開啟/切換/編輯）
+;   - 修正：虛擬資料夾（本機/控制台等 CLSID 路徑）不再被當成資料夾
+;   - 修正：純大小寫改名失敗時自動回滾暫存名
 ; =====================================================================
 
 global gGui := 0, gEdit := 0, gLV := 0, gPathTxt := 0, gStatus := 0, gSB := 0
 global gItems := [], gCurrentFolder := "", gScanTruncated := false
-global gChkSub := 0, gChkExc := 0, gChkExclDir := 0, gChkExclFile := 0
+global gChkSub := 0, gChkExc := 0, gChkExclDir := 0, gChkExclFile := 0, gChkTop := 0
 global gChkSmall := 0, gChkBig := 0, gChkOld := 0, gChkNew := 0
 global gEditKB := 0, gEditKBBig := 0, gEditDays := 0, gEditDaysNew := 0
 global gScBtns := [], gShortTop := 0, gSBH := 24, gHeaderHwnd := 0
@@ -33,12 +38,12 @@ global CF_HDROP := 15, GHND := 0x0042
 global INI := A_ScriptDir "\FolderFilter.ini"
 global RUNKEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run", RUNVAL := "FolderFilter"
 global SCAN_CAP := 200000, SORT_CAP := 20000, DISP_CAP := 5000
-global VER := "1.1.2"
+global VER := "1.2.0"
 ; 重開保留的 UI 狀態
 global gSt := Map("filter", "", "sub", 0, "exc", 0, "exclDir", 0, "exclFile", 0,
     "small", 0, "big", 0, "old", 0, "new", 0,
     "kb", "100", "kbBig", "10240", "days", "30", "daysNew", "7",
-    "x", "", "y", "", "w", 820, "h", 680)
+    "x", "", "y", "", "w", 820, "h", 680, "top", 1)
 ; 設定視窗暫存
 global gSetGui := 0, gSetState := 0, gSetHk := 0, gSetAuto := 0, gSetNames := [], gSetPaths := []
 
@@ -50,10 +55,13 @@ A_TrayMenu.Add("離開", (*) => ExitApp())
 
 ; ===================== 設定檔 =====================
 LoadConfig() {
-    global gHotkey, gShortcuts, INI
+    global gHotkey, gShortcuts, INI, gSt
     gHotkey := IniRead(INI, "General", "Hotkey", "^!f")
+    gSt["top"] := (IniRead(INI, "General", "TopMost", "1") = "1") ? 1 : 0
     cnt := IniRead(INI, "Shortcuts", "Count", "10")
     cnt := (IsInteger(cnt) && cnt + 0 >= 10) ? cnt + 0 : 10
+    if (cnt > 30)
+        cnt := 30
     gShortcuts := []
     loop cnt {
         n := IniRead(INI, "Shortcuts", A_Index "Name", "")
@@ -111,7 +119,7 @@ ShowFilter() {
         return
     }
     folder := GetActiveExplorerPath()
-    if (folder != "")
+    if (folder != "" && DirExist(folder))   ; 排除虛擬資料夾（本機/控制台等 CLSID），只接受真實路徑
         gCurrentFolder := folder
     BuildGui()
     ScanItems()
@@ -154,7 +162,7 @@ BuildGui() {
         try gGui.Destroy()
         gGui := 0
     }
-    gGui := Gui("+AlwaysOnTop +Resize +MinSize640x500", "資料夾篩選  v" VER)
+    gGui := Gui((gSt["top"] ? "+AlwaysOnTop " : "") "+Resize +MinSize640x500", "資料夾篩選  v" VER)
     gGui.SetFont("s10", "Segoe UI")
     gGui.MarginX := 10, gGui.MarginY := 10
 
@@ -167,10 +175,12 @@ BuildGui() {
     gChkExc := gGui.AddCheckbox("x+24 yp", "排除關鍵字"), gChkExc.Value := gSt["exc"]
     gChkExclDir := gGui.AddCheckbox("x+24 yp", "排除資料夾"), gChkExclDir.Value := gSt["exclDir"]
     gChkExclFile := gGui.AddCheckbox("x+24 yp", "排除檔案"), gChkExclFile.Value := gSt["exclFile"]
+    gChkTop := gGui.AddCheckbox("x+24 yp", "最上層顯示"), gChkTop.Value := gSt["top"]
     gChkSub.OnEvent("Click", (*) => OnModeChange())
     gChkExc.OnEvent("Click", (*) => DoFilter())
     gChkExclDir.OnEvent("Click", (*) => DoFilter())
     gChkExclFile.OnEvent("Click", (*) => DoFilter())
+    gChkTop.OnEvent("Click", (*) => ToggleTopMost())
 
     gChkSmall := gGui.AddCheckbox("xm", "排除小於"), gChkSmall.Value := gSt["small"]
     gEditKB := gGui.AddEdit("x+6 yp w64", gSt["kb"])
@@ -205,6 +215,7 @@ BuildGui() {
         i := A_Index
         b := gGui.AddButton((i = 1 ? "xm" : "x+5 yp") " w100 h26", ShortcutLabel(i))
         b.OnEvent("Click", ShortcutClick.Bind(i))
+        try b.OnEvent("ContextMenu", ShortcutCtxMenu.Bind(i))
         gScBtns.Push(b)
     }
     gScBtns[1].GetPos(, &sy)
@@ -251,7 +262,7 @@ SaveOnHide() {
 }
 
 SaveUIState() {
-    global gGui, gSt, gLV, gEdit, gChkSub, gChkExc, gChkExclDir, gChkExclFile
+    global gGui, gSt, gLV, gEdit, gChkSub, gChkExc, gChkExclDir, gChkExclFile, gChkTop
     global gChkSmall, gChkBig, gChkOld, gChkNew, gEditKB, gEditKBBig, gEditDays, gEditDaysNew
     if !gGui
         return
@@ -269,6 +280,7 @@ SaveUIState() {
         gSt["cols"] := cols
     }
     gSt["filter"] := gEdit.Value
+    gSt["top"] := gChkTop.Value
     gSt["sub"] := gChkSub.Value, gSt["exc"] := gChkExc.Value
     gSt["exclDir"] := gChkExclDir.Value, gSt["exclFile"] := gChkExclFile.Value
     gSt["small"] := gChkSmall.Value, gSt["big"] := gChkBig.Value
@@ -325,11 +337,24 @@ OnModeChange() {
     gEdit.Focus()
 }
 
+ToggleTopMost() {
+    global gSt, gChkTop, INI
+    gSt["top"] := gChkTop.Value
+    ApplyTopMost()
+    IniWrite(gSt["top"], INI, "General", "TopMost")
+}
+
+ApplyTopMost() {
+    global gGui, gSt
+    if gGui
+        try gGui.Opt((gSt["top"] ? "+" : "-") "AlwaysOnTop")
+}
+
 PickFolder() {
     global gGui, gCurrentFolder, gEdit
     gGui.Opt("-AlwaysOnTop")
     sel := DirSelect(gCurrentFolder != "" ? "*" gCurrentFolder : "", 3, "選擇要篩選的資料夾")
-    gGui.Opt("+AlwaysOnTop")
+    ApplyTopMost()
     if (sel != "") {
         gCurrentFolder := sel
         Refresh()
@@ -749,7 +774,7 @@ RenameSelected() {
     SplitPath(path, &nm, &dir)
     gGui.Opt("-AlwaysOnTop")
     ib := InputBox("輸入新名稱：", "重新命名", "w380 h130", nm)
-    gGui.Opt("+AlwaysOnTop")
+    ApplyTopMost()
     if (ib.Result != "OK")
         return
     newName := Trim(ib.Value)
@@ -771,10 +796,18 @@ RenameSelected() {
             tmp := dir "\" nm ".__rn" A_TickCount   ; 純大小寫變更：經暫存名兩段式改名
             if isDir {
                 DirMove(path, tmp, "R")
-                DirMove(tmp, newPath, "R")
+                try DirMove(tmp, newPath, "R")
+                catch {
+                    DirMove(tmp, path, "R")   ; 第二段失敗 → 回滾為原名
+                    throw
+                }
             } else {
                 FileMove(path, tmp, 0)
-                FileMove(tmp, newPath, 0)
+                try FileMove(tmp, newPath, 0)
+                catch {
+                    FileMove(tmp, path, 0)    ; 第二段失敗 → 回滾為原名
+                    throw
+                }
             }
         } else if isDir
             DirMove(path, newPath, "R")
@@ -1071,6 +1104,15 @@ ShortcutLabel(i) {
 
 ShortcutClick(i, *) {
     global gShortcuts, gCurrentFolder, gEdit
+    static lastI := 0, lastT := 0
+    ; 快速點兩下（Button 無原生雙擊事件，用時間差偵測）→ 在檔案總管開啟
+    now := A_TickCount
+    if (i = lastI && now - lastT <= DllCall("GetDoubleClickTime", "UInt")) {
+        lastI := 0, lastT := 0
+        OpenShortcutInExplorer(i)
+        return
+    }
+    lastI := i, lastT := now
     sc := gShortcuts[i]
     if (sc.path = "" || !DirExist(sc.path)) {
         ShowSettings()
@@ -1079,6 +1121,33 @@ ShortcutClick(i, *) {
     gCurrentFolder := sc.path
     Refresh()
     gEdit.Focus()
+}
+
+OpenShortcutInExplorer(i) {
+    global gShortcuts
+    sc := gShortcuts[i]
+    if (sc.path = "" || !DirExist(sc.path)) {
+        ShowSettings()
+        return
+    }
+    try Run('explorer.exe "' sc.path '"')
+    catch as e
+        TopMsg("開啟資料夾失敗：`n" e.Message, "錯誤")
+}
+
+; 右鍵捷徑：選單（開啟路徑 / 切換篩選 / 編輯捷徑）
+ShortcutCtxMenu(i, *) {
+    global gShortcuts
+    sc := gShortcuts[i]
+    m := Menu()
+    if (sc.path != "" && DirExist(sc.path)) {
+        m.Add("開啟路徑（檔案總管）", (*) => OpenShortcutInExplorer(i))
+        m.Add("切換篩選到此資料夾", (*) => ShortcutClick(i))
+        m.Add("複製路徑", (*) => (A_Clipboard := sc.path, Tip("路徑已複製")))
+        m.Add()
+    }
+    m.Add("編輯捷徑…", (*) => ShowSettings())
+    m.Show()
 }
 
 ; ===================== 設定視窗 =====================
